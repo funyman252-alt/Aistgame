@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Бесконечный платформер</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #111; overflow: hidden; touch-action: none; }
+    body { display: flex; align-items: center; justify-content: center; }
+    canvas {
+      max-width: 100vw; max-height: 100vh;
+      width: 100%; height: auto;
+      aspect-ratio: 4 / 3;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="800" height="600"></canvas>
+
+  <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    // --- КОНСТАНТЫ (как в Python-версии) ---
+    const WIDTH = 800, HEIGHT = 600;
+    const GROUND_H = 60;
+    const GRASS_DEPTH = 25;
+    const STAND_Y = HEIGHT - GROUND_H + GRASS_DEPTH;
+    const GRAVITY = 1;
+    const JUMP_SPEED = -21;
+    const PLAYER_HITBOX_SHRINK_X = 30;
+    const PLAYER_HITBOX_SHRINK_Y = 25;
+
+    // --- ЗАГРУЗКА КАРТИНОК (с заглушкой, как в Python) ---
+    function loadSprite(path, w, h, fallbackColor) {
+      const spr = { img: null, w, h, color: fallbackColor };
+      const image = new Image();
+      image.onload = () => { spr.img = image; };
+      image.onerror = () => { console.log('Нет файла ' + path + '. Использую цветную заглушку.'); };
+      image.src = path;
+      return spr;
+    }
+
+    const bgImg        = loadSprite('background.png', WIDTH, HEIGHT, '#87ceeb');
+    const groundImg    = loadSprite('ground.png', WIDTH, GROUND_H, '#228b22');
+    const obstacleImg  = loadSprite('obstacle.png', 60, 90, '#c83232');
+    const playerImg    = loadSprite('player.png', 100, 100, '#0064ff');
+
+    // Опциональные кадры анимации (нет файла — не добавляем)
+    const birdFrames = [];
+    for (let i = 1; i <= 3; i++) {
+      const img = new Image();
+      img.onload = () => birdFrames.push({ img, w: 100, h: 100 });
+      img.src = 'bird_frame' + i + '.png';
+    }
+
+    // --- ЗВУКИ (опциональные) ---
+    const jumpSound = new Audio('jump.wav'); jumpSound.volume = 0.6;
+    const hitSound  = new Audio('hit.wav');  hitSound.volume  = 0.7;
+    const music     = new Audio('music.ogg'); music.volume = 0.4; music.loop = true;
+    // музыку запустим при первом касании (браузеры запрещают автозапуск звука)
+    let musicStarted = false;
+
+    function tryPlay(sound) {
+      sound.play().catch(() => {}); // если файла нет — просто игнорируем
+    }
+
+    // --- ОБЛАКА ДЛЯ ПАРАЛЛАКСА (рисуем кодом, как в Python) ---
+    function makeCloud(w, h) {
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const g = c.getContext('2d');
+      g.fillStyle = 'rgba(255,255,255,0.78)';
+      // три «шапки» разной высоты — получается объёмное облако
+      g.beginPath(); g.ellipse(w / 2, h * 2 / 3, w / 2, h / 3, 0, 0, Math.PI * 2); g.fill();
+      g.beginPath(); g.ellipse(w * 0.35, h * 0.5, w / 5, h / 2, 0, 0, Math.PI * 2); g.fill();
+      g.beginPath(); g.ellipse(w * 0.75, h * 0.6, w / 4, h * 0.4, 0, 0, Math.PI * 2); g.fill();
+      return c;
+    }
+
+    function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+    const clouds = [];
+    for (let i = 0; i < 7; i++) {
+      const w = randomInt(90, 180), h = randomInt(30, 55);
+      clouds.push({
+        surf: makeCloud(w, h),
+        x: randomInt(-100, WIDTH),
+        y: randomInt(30, HEIGHT / 2),
+        speed: 0.15 + Math.random() * 0.3 // доля от скорости мира
+      });
+    }
+
+    // --- СОСТОЯНИЕ ИГРЫ ---
+    const player = {
+      x: 150,
+      bottom: STAND_Y,   // аналогично player_rect.bottom
+      w: 100, h: 100,
+      velocityY: 0,
+      onGround: true
+    };
+
+    let worldSpeed = 6;
+    let worldX = 0;
+    let nextObstacleX = 600;
+    let obstacles = [];   // {x, y, w, h}
+    let score = 0;
+    let gameOver = false;
+
+    let frameIndex = 0;
+    let frameTimer = 0;
+    let bobPhase = 0;
+
+    function resetGame() {
+      obstacles = [];
+      worldSpeed = 6;
+      worldX = 0;
+      nextObstacleX = 600;
+      score = 0;
+      player.bottom = STAND_Y;
+      player.velocityY = 0;
+      player.onGround = true;
+      gameOver = false;
+      frameIndex = 0;
+      frameTimer = 0;
+      bobPhase = 0;
+    }
+
+    // Хитбокс игрока (уменьшенный, как в Python)
+    function playerHitbox() {
+      return {
+        x: player.x + PLAYER_HITBOX_SHRINK_X / 2,
+        y: player.bottom - player.h + PLAYER_HITBOX_SHRINK_Y / 2,
+        w: player.w - PLAYER_HITBOX_SHRINK_X,
+        h: player.h - PLAYER_HITBOX_SHRINK_Y
+      };
+    }
+
+    // --- ВВОД: касание / клик / пробел ---
+    function handleInput() {
+      if (!musicStarted) {
+        musicStarted = true;
+        tryPlay(music);
+      }
+      if (gameOver) {
+        resetGame();
+      } else if (player.onGround) {
+        player.velocityY = JUMP_SPEED;
+        player.onGround = false;
+        tryPlay(jumpSound);
+      }
+    }
+
+    canvas.addEventListener('pointerdown', handleInput);
+    window.addEventListener('keydown', e => {
+      if (e.code === 'Space') { e.preventDefault(); handleInput(); }
+    });
+
+    // --- ОБНОВЛЕНИЕ ---
+    function update() {
+      if (gameOver) return;
+
+      worldX += worldSpeed;
+
+      // Облака плывут МЕДЛЕННЕЕ мира (параллакс)
+      for (const c of clouds) {
+        c.x -= worldSpeed * c.speed;
+        if (c.surf.width + c.x < -20) {
+          c.x = WIDTH + randomInt(0, 200);
+          c.y = randomInt(30, HEIGHT / 2);
+        }
+      }
+
+      for (const obs of obstacles) obs.x -= worldSpeed;
+
+      if (worldX + WIDTH > nextObstacleX) {
+        const w = randomInt(40, 70), h = randomInt(50, 90);
+        obstacles.push({ x: WIDTH + 50, y: STAND_Y - h, w, h });
+        nextObstacleX += randomInt(350, 650);
+      }
+
+      obstacles = obstacles.filter(o => o.x + o.w > -50);
+
+      // Физика прыжка
+      player.velocityY += GRAVITY;
+      player.bottom += player.velocityY;
+      if (player.bottom >= STAND_Y) {
+        player.bottom = STAND_Y;
+        player.velocityY = 0;
+        player.onGround = true;
+      }
+
+      // Столкновения
+      const hitbox = playerHitbox();
+      for (const obs of obstacles) {
+        const obsHitbox = { x: obs.x + 7, y: obs.y + 9, w: obs.w - 14, h: obs.h - 18 };
+        const collide =
+          hitbox.x < obsHitbox.x + obsHitbox.w &&
+          hitbox.x + hitbox.w > obsHitbox.x &&
+          hitbox.y < obsHitbox.y + obsHitbox.h &&
+          hitbox.y + hitbox.h > obsHitbox.y;
+        if (collide) {
+          gameOver = true;
+          tryPlay(hitSound);
+          break;
+        }
+      }
+
+      worldSpeed += 0.002;
+      score = Math.floor(worldX / 100);
+    }
+
+    // --- ОТРИСОВКА ---
+    function drawSprite(spr, x, y, w, h) {
+      if (spr.img) {
+        ctx.drawImage(spr.img, x, y, w, h);
+      } else {
+        ctx.fillStyle = spr.color;
+        ctx.fillRect(x, y, w, h);
+      }
+    }
+
+    function draw() {
+      // СНАЧАЛА фон
+      drawSprite(bgImg, 0, 0, WIDTH, HEIGHT);
+
+      // потом облака поверх
+      for (const c of clouds) ctx.drawImage(c.surf, c.x, c.y);
+
+      // земля (зацикленная)
+      const groundOffset = -(worldX % WIDTH);
+      drawSprite(groundImg, groundOffset, HEIGHT - GROUND_H, WIDTH, GROUND_H);
+      drawSprite(groundImg, groundOffset + WIDTH, HEIGHT - GROUND_H, WIDTH, GROUND_H);
+
+      // препятствия
+      for (const obs of obstacles) drawSprite(obstacleImg, obs.x, obs.y, obs.w, obs.h);
+
+      // --- АНИМАЦИЯ АИСТА ---
+      let currentBird = playerImg;
+      let birdDrawY = player.bottom - player.h;
+
+      frameTimer++;
+      if (birdFrames.length > 0) {
+        // Настоящие кадры: переключаем каждые 8 тиков
+        if (frameTimer >= 8) {
+          frameTimer = 0;
+          frameIndex = (frameIndex + 1) % birdFrames.length;
+        }
+        currentBird = birdFrames[frameIndex];
+      } else {
+        // Покачивание: плавный сдвиг вверх-вниз
+        bobPhase += 0.1;
+        birdDrawY += (bobPhase % 2) < 1 ? 4 : -4;
+      }
+
+      drawSprite(currentBird, player.x, birdDrawY, player.w, player.h);
+
+      // Счёт
+      ctx.font = '28px Arial';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('Очки: ' + score, 20, 40);
+
+      if (gameOver) {
+        ctx.font = '48px Arial';
+        ctx.fillStyle = '#c80000';
+        ctx.fillText('GAME OVER', WIDTH / 2 - 130, HEIGHT / 2);
+        ctx.font = '28px Arial';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('Коснитесь экрана — заново', WIDTH / 2 - 170, HEIGHT / 2 + 60);
+      }
+    }
+
+    // --- ИГРОВОЙ ЦИКЛ (60 FPS) ---
+    function loop() {
+      update();
+      draw();
+      requestAnimationFrame(loop);
+    }
+    loop();
+  </script>
+</body>
+</html>
